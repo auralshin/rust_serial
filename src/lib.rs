@@ -1,163 +1,79 @@
-use bson::serde_helpers;
+use base64::{
+    alphabet,
+    engine::{self, general_purpose},
+    Engine,
+};
 use flate2::{bufread::GzDecoder, write::GzEncoder, Compression};
 use neon::prelude::*;
-use rmp_serde::{Deserializer, Serializer};
-use rmp_serde::{Deserializer, Serializer};
-use serde::de::DeserializeOwned;
-use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use serde_json;
 use std::io::prelude::*;
-use std::sync::Arc;
-use tokio::runtime::Runtime;
 
 #[derive(Serialize, Deserialize, Debug)]
-pub struct Data {
+struct Data {
     value: String,
 }
 
-#[derive(Debug, Clone)]
-pub enum SerializationFormat {
-    Json,
-    MessagePack,
-    Bson,
-}
-
-pub struct Options {
-    format: SerializationFormat,
+pub struct SerializerOptions {
     compression: Compression,
 }
 
-impl Default for Options {
-    fn default() -> Self {
-        Self {
-            format: SerializationFormat::Json,
-            compression: Compression::fast(),
-        }
+impl SerializerOptions {
+    pub fn new(compression: Compression) -> Self {
+        Self { compression }
     }
 }
 
-fn compress_data(data: &[u8], compression: Compression) -> Result<Vec<u8>, String> {
+fn compress_data(data: &[u8], compression: Compression) -> Vec<u8> {
     let mut encoder = GzEncoder::new(Vec::new(), compression);
-    encoder.write_all(data).map_err(|e| e.to_string())?;
-    encoder.finish().map_err(|e| e.to_string())
+    encoder.write_all(data).unwrap();
+    encoder.finish().unwrap()
 }
 
-fn decompress_data(data: &[u8]) -> Result<Vec<u8>, String> {
+fn decompress_data(data: &[u8]) -> Vec<u8> {
     let mut decoder = GzDecoder::new(data);
     let mut decompressed = Vec::new();
-    decoder
-        .read_to_end(&mut decompressed)
-        .map_err(|e| e.to_string())?;
-    Ok(decompressed)
+    decoder.read_to_end(&mut decompressed).unwrap();
+    decompressed
 }
 
-struct SerializeTask {
-    data: Arc<Data>,
-    options: Arc<Options>,
-}
-
-impl Task for SerializeTask {
-    type Output = String;
-    type Error = String;
-    type JsValue = JsString;
-
-    fn perform(&self) -> Result<Self::Output, Self::Error> {
-        let serialized = match self.options.format {
-            SerializationFormat::Json => serde_json::to_vec(&self.data),
-            SerializationFormat::MessagePack => {
-                let mut buf = Vec::new();
-                self.data
-                    .serialize(&mut Serializer::new(&mut buf))
-                    .map(|_| buf)
-            }
-            SerializationFormat::Bson => {
-                serde_helpers::to_bson(&self.data).map_err(|e| e.to_string())?
-            }
-        };
-        let serialized_data = serialized.map_err(|e| e.to_string())?;
-        let compressed_data = compress_data(&serialized_data, self.options.compression)?;
-        Ok(base64::encode(&compressed_data))
-    }
-
-    fn complete(
-        self,
-        mut cx: TaskContext,
-        result: Result<Self::Output, Self::Error>,
-    ) -> JsResult<Self::JsValue> {
-        let result_str = result.map_err(|e| cx.string(e))?;
-        Ok(cx.string(result_str))
-    }
-}
-
-fn serialize(mut cx: FunctionContext) -> JsResult<JsUndefined> {
+fn serialize(mut cx: FunctionContext) -> JsResult<JsString> {
     let input = cx.argument::<JsString>(0)?.value(&mut cx);
-    let data: Data = serde_json::from_str(&input)
-        .map_err(|err| cx.throw_error(format!("Failed to parse input: {}", err)))?;
+    let data: Data = serde_json::from_str(&input).unwrap();
 
-    let options = Options::default(); // You can customize the options here or accept them as a function argument.
+    let compression = cx.argument::<JsNumber>(1)?.value(&mut cx) as u32;
+    let options = SerializerOptions::new(Compression::new(compression));
 
-    let task = SerializeTask {
-        data: Arc::new(data),
-        options: Arc::new(options),
-    };
-    let callback = cx.argument::<JsFunction>(1)?;
-    task.schedule(callback);
-    Ok(cx.undefined())
+    let serialized = serde_json::to_string(&data).unwrap();
+    let compressed = compress_data(serialized.as_bytes(), options.compression);
+
+    // Create a base64 engine instance
+    let base64_engine = general_purpose::STANDARD; // Adjust according to your needs
+
+    // Encode using the engine
+    let encoded = base64_engine.encode(&compressed);
+
+    Ok(cx.string(encoded))
 }
 
-struct DeserializeTask {
-    serialized: String,
-    options: Arc<Options>,
+fn deserialize(mut cx: FunctionContext) -> JsResult<JsString> {
+    let input = cx.argument::<JsString>(0)?.value(&mut cx);
+
+    // Create a custom base64 decoding engine
+    const CUSTOM_ENGINE: engine::GeneralPurpose =
+        engine::GeneralPurpose::new(&alphabet::URL_SAFE, general_purpose::NO_PAD);
+
+    // Decode using the custom engine
+    let compressed_data = CUSTOM_ENGINE.decode(input).unwrap();
+
+    let decompressed = decompress_data(&compressed_data);
+    let data: Data = serde_json::from_slice(&decompressed).unwrap();
+
+    Ok(cx.string(data.value))
 }
 
-impl Task for DeserializeTask {
-    type Output = Data;
-    type Error = String;
-    type JsValue = JsValue;
-
-    fn perform(&self) -> Result<Self::Output, Self::Error> {
-        let compressed_data = base64::decode(&self.serialized).map_err(|e| e.to_string())?;
-        let decompressed_data = decompress_data(&compressed_data)?;
-        let deserialized = match self.options.format {
-            SerializationFormat::Json => serde_json::from_slice(&decompressed_data),
-            SerializationFormat::MessagePack => Ok({
-                let mut de = Deserializer::new(&decompressed_data[..]);
-                Deserialize::deserialize(&mut de)
-            }),
-            SerializationFormat::Bson => serde_helpers::from_bson(
-                serde_helpers::deserialize_bson(&decompressed_data).map_err(|e| e.to_string())?,
-            )
-            .map_err(|e| e.to_string())?,
-        };
-        deserialized.map_err(|e| e.to_string())
-    }
-
-    fn complete(
-        self,
-        mut cx: TaskContext,
-        result: Result<Self::Output, Self::Error>,
-    ) -> JsResult<Self::JsValue> {
-        let data = result.map_err(|e| cx.string(e))?;
-        let object = neon_serde::to_value(&mut cx, &data)?;
-        Ok(object)
-    }
-}
-fn deserialize(mut cx: FunctionContext) -> JsResult<JsUndefined> {
-    let serialized = cx.argument::<JsString>(0)?.value(&mut cx);
-    let options = Options::default(); // You can customize the options here or accept them as a function argument.
-
-    let task = DeserializeTask {
-        serialized,
-        options: Arc::new(options),
-    };
-    let callback = cx.argument::<JsFunction>(1)?;
-    task.schedule(callback);
-
-    Ok(cx.undefined())
-}
-register_module!(mut cx, {
+#[neon::main]
+fn main(mut cx: ModuleContext) -> NeonResult<()> {
     cx.export_function("serialize", serialize)?;
     cx.export_function("deserialize", deserialize)?;
     Ok(())
-});
+}
