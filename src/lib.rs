@@ -6,7 +6,7 @@ use base64::{
 use flate2::{bufread::GzDecoder, write::GzEncoder, Compression};
 use neon::prelude::*;
 use serde::{Deserialize, Serialize};
-use std::io::prelude::*;
+use std::io::{Read, Write};
 
 #[derive(Serialize, Deserialize, Debug)]
 struct Data {
@@ -23,17 +23,20 @@ impl SerializerOptions {
     }
 }
 
-fn compress_data(data: &[u8], compression: Compression) -> Vec<u8> {
+fn compress_data(
+    data: &[u8],
+    compression: Compression,
+) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
     let mut encoder = GzEncoder::new(Vec::new(), compression);
-    encoder.write_all(data).unwrap();
-    encoder.finish().unwrap()
+    encoder.write_all(data)?;
+    Ok(encoder.finish()?)
 }
 
-fn decompress_data(data: &[u8]) -> Vec<u8> {
+fn decompress_data(data: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
     let mut decoder = GzDecoder::new(data);
     let mut decompressed = Vec::new();
-    decoder.read_to_end(&mut decompressed).unwrap();
-    decompressed
+    decoder.read_to_end(&mut decompressed)?;
+    Ok(decompressed)
 }
 
 fn serialize(mut cx: FunctionContext) -> JsResult<JsString> {
@@ -44,7 +47,8 @@ fn serialize(mut cx: FunctionContext) -> JsResult<JsString> {
     let options = SerializerOptions::new(Compression::new(compression));
 
     let serialized = serde_json::to_string(&data).unwrap();
-    let compressed = compress_data(serialized.as_bytes(), options.compression);
+    let compressed = compress_data(serialized.as_bytes(), options.compression)
+        .or_else(|err| cx.throw_error(format!("Compression error: {}", err)))?;
 
     // Create a base64 engine instance
     let base64_engine = general_purpose::STANDARD; // Adjust according to your needs
@@ -65,7 +69,8 @@ fn deserialize(mut cx: FunctionContext) -> JsResult<JsString> {
     // Decode using the custom engine
     let compressed_data = CUSTOM_ENGINE.decode(input).unwrap();
 
-    let decompressed = decompress_data(&compressed_data);
+    let decompressed = decompress_data(&compressed_data)
+        .or_else(|err| cx.throw_error(format!("Decompression error: {}", err)))?;
     let data: Data = serde_json::from_slice(&decompressed).unwrap();
 
     Ok(cx.string(data.value))
